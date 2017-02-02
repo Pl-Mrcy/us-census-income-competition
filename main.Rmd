@@ -1,0 +1,638 @@
+---
+title: "US Census - Income Competition"
+author: "Paul Marcilhacy"
+date: "02/02/2017"
+output:
+  md_document:
+    variant: markdown_github
+---
+
+# Introduction
+
+In this analysis, we use a us census dataset containing detailed but anonymised information for approximately 300,000 people. We will use this data to create a model to try to "predict" who is earning more or less than $50,000 / year.
+
+We will detail the different steps of the analysis. In the first part, we realize a quick audit of the data, then we build the model based on the training set and finally, we will confront our model to "reality" using the test set.
+
+This analysis is entirely realized in R. First, let's set the environment
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r environment_setup, include=TRUE, eval=TRUE, message=FALSE, warning=FALSE}
+require(data.table)
+require(dplyr)
+require(ggplot2)
+require(xgboost)
+require(Matrix)
+require(DiagrammeR)
+require(reshape2)
+require(gridExtra)
+require(lazyeval)
+require(caret)
+require(Metrics)
+require(scales)
+
+source("utilities/plot_utilities.R")
+source("utilities/metrics_utilities.R")
+```
+
+# Data Exploration
+In this part I carry out a quick audit of the training data.
+
+## Load Data
+
+First, I load the training data and make sure that all the categorical variables are indeed factors.
+```{r load_training_data, eval=TRUE}
+train_data <- data.table::fread(input = "data/census_income_learn.csv", header = F, sep = ",")
+
+colnames <- c("age", "class_worker", "industry", "occupation", "education",  "wage_per_hour",
+                       "enrolled_edu_inst_last_wk", "marital_status", "major_industry", "major_occupation",
+                       "race", "hispanic_origin", "sex", "labor_union", "unemployment_reason",
+                       "full_part_employment", "capital_gains", "capital_losses", "dividends_stocks",
+                       "tax_filer_status", "region_previous_residence", "state_previous_residence", 
+                       "detailed_family_stat", "detailed_household_summary", "instance_weight",
+                       "migration_code_change_msa", "migration_code_change_reg", "migration_code_move_reg",
+                       "same_house_1_ago", "migration_prev_res_sunbelt", "num_persons_employer", 
+                       "family_members_under_18", "father_country_birth", "mother_country_birth", 
+                       "country_birth", "citizenship", "own_business_self_employed", 
+                       "questionnaire_veteran_admin", "veteran_benefits", "weeks_worked_year", "year", 
+                       "target"
+)
+names(train_data) <- colnames
+
+categorical_vars <- c("class_worker", "industry", "occupation", "education",
+                      "enrolled_edu_inst_last_wk", "marital_status", "major_industry", "major_occupation",
+                      "race", "hispanic_origin", "sex", "labor_union", "unemployment_reason",
+                      "full_part_employment",
+                      "tax_filer_status", "region_previous_residence", "state_previous_residence", 
+                      "detailed_family_stat", "detailed_household_summary", "migration_code_change_msa",
+                      "migration_code_change_reg", "migration_code_move_reg", "same_house_1_ago",
+                      "migration_prev_res_sunbelt", "family_members_under_18",
+                      "father_country_birth", "mother_country_birth", "country_birth", "citizenship",
+                      "own_business_self_employed", "questionnaire_veteran_admin", "veteran_benefits", 
+                      "year", "target"
+)
+train_data <- train_data %>%
+     mutate_each_(funs(as.factor(.))
+                  , categorical_vars)
+
+summary(train_data)
+```
+
+We named "target" the variable we try to predict - if the person earned more or less than $50K / year.
+
+We observe that the training set is very unbalanced. Indeed the share of people earning more than \$50K is only `r scales::percent(sum(train_data$target == "50000+.")/length(train_data$target))` in the training set.
+
+## Categorical variables
+
+Let's plot bar charts of the number of records for each "target" (incomes superior to $50K or less) sliced by several categorical variables.
+
+We create a plot for all categorical variables.
+```{r cat_vars_plots, eval=TRUE}
+# All categorical variables
+factor_vars <- names(train_data)[sapply(train_data, is.factor)]
+
+# A plot for for each categorical variable
+plots <- list()
+for (var in factor_vars) {
+     plots[[var]] <- train_data[, c(var, "target")] %>%
+          ggplot(., aes_string(var, fill = "target")) + 
+          geom_bar(aes(y = (..count..)/sum(..count..)), position = "dodge") +
+          scale_fill_manual(values = c("#041B2E", "#2BB2AD")) +
+          scale_y_continuous(labels = percent) +
+          ylab("")
+     
+     if (var == factor_vars[1]) {
+          plots[[var]] <- plots[[var]] +
+               theme(legend.position = "bottom")
+     } else {
+          plots[[var]] <- plots[[var]] +
+               theme(legend.position = "none")
+     }
+}
+
+# Here we save separately a legend, so that we can reuse in all multiplot situation.
+mylegend <- get_legend(plots[[1]])
+plots[[1]] <- plots[[1]] +
+     theme(legend.position = "none")
+```
+
+First, let's slice by race, sex and citizenship.
+```{r cat_plot_1, fig.align="center"}
+grid.arrange(do.call(arrangeGrob, plots[c("race", "sex", "citizenship")])
+             , mylegend, nrow = 2, heights = c (10, 1)
+)
+```
+
+Second, let's show the split by education level, belonging to a labor union, and if the interogated person has lived in the same house more than a year or not.
+```{r cat_plot_2, fig.align="center"}
+grid.arrange(do.call(arrangeGrob, plots[c("education", "labor_union", "same_house_1_ago")])
+, mylegend, nrow = 2, heights = c (10, 1)
+)
+```
+
+Let's show the sames chart but not as percentages of the total number of people interrogated but as percentages of people interrogated belonging to the same target bucket.
+
+First: race, sex and citizenship
+```{r plot_percentages, eval=TRUE, fig.align="center"}
+plots <- list()
+for (var in factor_vars) {
+     plots[[var]] <- train_data[, c(var, "target")] %>% 
+          group_by_(.dots = c(var, "target")) %>%
+          summarise(., count = n()) %>%
+          group_by_(.dots = c("target")) %>%
+          mutate(perc = count/sum(count)) %>%
+          ungroup() %>%
+          ggplot(., aes_string(x = var, y = "perc", fill = "target")) +
+          geom_bar(stat="identity", position = "dodge") +
+          scale_fill_manual(values = c("#041B2E", "#2BB2AD")) +
+          scale_y_continuous(labels = percent) +
+          ylab("") +
+          theme(legend.position = "none")
+     
+}
+
+grid.arrange(do.call(arrangeGrob, plots[c("race", "sex", "citizenship")])
+             , mylegend, nrow = 2, heights = c (10, 1)
+)
+```
+
+Then again, education, labor union and living in the same house more than a year.
+```{r plot_percentages_2, eval=TRUE, fig.align="center"}
+grid.arrange(do.call(arrangeGrob, plots[c("education", "labor_union", "same_house_1_ago")])
+             , mylegend, nrow = 2, heights = c (10, 1)
+)
+```
+
+In the opposite, if we show percentages of each target bucket by category:
+```{r plot_percentages_bucket, eval=TRUE, fig.align="center"}
+require(lazyeval)
+
+plots <- list()
+for(var in factor_vars){
+     
+     varval <- interp(~substr(var, 1, 5), var = as.name(var))
+     
+     plots[[var]] <- train_data[, c(var, "target")] %>% 
+          group_by_(.dots = c(var, "target")) %>%
+          summarise(count = n()) %>%
+          group_by_(.dots = c(var)) %>%
+          dplyr::mutate(perc = count/sum(count)) %>%
+          ungroup() %>%
+          dplyr::mutate_(.dots = setNames(list(varval), var)) %>%
+          ggplot(., aes_string(x = var, y = "perc", fill = "target")) +
+          geom_bar(stat="identity", position = "dodge") +
+          scale_fill_manual(values = c("#041B2E", "#2BB2AD")) +
+          scale_y_continuous(labels = percent) +
+          ylab("") +
+          theme(legend.position = "none")
+}
+grid.arrange(do.call(arrangeGrob, plots[c("education", "labor_union", "same_house_1_ago")])
+             , mylegend, nrow = 2, heights = c (10, 1)
+)
+```
+
+The dataset being very unbalance no mater the category we choose the split it. However, we clearly that the share of people in the +$50k bucket is much higher for people with higher education. Actually, for some particular education levels, it is more than 50% of the population (PhD and Prof school degree).
+
+You can plot all the charts, 3 by 3 running:
+```{r all_cat_plots, eval=FALSE}
+marrangeGrob(plots[1:12], nrow = 3, ncol = 1)
+marrangeGrob(plots[13:25], nrow = 3, ncol = 1)
+marrangeGrob(plots[26:35], nrow = 3, ncol = 1)
+```
+
+## Continuous variables
+
+Now, let's have a look at the continuous variables. We will plot histograms of these variables.
+```{r continuous_vars_plot, warning=FALSE, message=FALSE, eval=TRUE, fig.align="center"}
+# continuous variables in the set
+continuous_vars <- names(train_data)[!sapply(train_data, is.factor)]
+
+# create a list containing all the histograms of the continuous variables
+plots <- list()
+for (var in continuous_vars) {
+     plots[[var]] <- train_data[, c(var, "target")] %>%
+          ggplot(., aes_string(var, fill = "target")) + 
+          geom_histogram(position = "dodge", color = "white") +
+          #scale_y_log10() +
+          ylab(var) +
+          scale_fill_manual(values = c("#041B2E", "#2BB2AD")) +
+          theme(legend.position = "none")
+}
+
+# Plot all the histograms in one plot
+grid.arrange(do.call(arrangeGrob, plots)
+             , mylegend, nrow = 2, heights = c (10, 1)
+             , top = "Histograms of all continuous variables in the train set"
+)
+```
+
+For most of the variables, we can't barely see anything, because too many elements are in 0. 
+Let's try to exclude elements with 0, to have a better look of the rest of the histograms.
+```{r continuous_vars_plot_2, warning=FALSE, message=FALSE, eval=TRUE, fig.align="center"}
+plots <- list()
+
+for (var in continuous_vars) {
+     cond <- interp(~ var > 0, var = as.name(var))
+     
+     plot_data <- train_data[, c(var, "target")] %>%
+          dplyr::filter_(cond)
+     
+     plots[[var]] <- plot_data %>%
+          ggplot(., aes_string(var, fill = "target")) + 
+          geom_histogram(position = "dodge", color = "white") +
+          ylab(var) +
+          scale_fill_manual(values = c("#041B2E", "#2BB2AD")) +
+          theme(legend.position = "none")
+}
+
+grid.arrange(do.call(arrangeGrob, plots)
+             , mylegend, nrow = 2, heights = c (10, 1)
+             , top = "Histograms of all continuous variables in the train set"
+)
+```
+
+Let's focus on the ages density in our data
+```{r age_hist_plot, message = FALSE, warning = FALSE, eval=TRUE, fig.align="center"}
+ggplot(data = train_data, aes(x = age, fill = target)) +
+     geom_histogram(color = "white", position = "dodge") +
+     scale_fill_manual(values = c("#041B2E", "#2BB2AD"))
+```
+
+## NAs
+
+We observed already that there is quite a lot of "unkown"/"not in universe" in the data. Are there also NAs in the data and where are they?
+Indeed, NAs may break the algorithms we will use the next part of this analysis.
+
+```{r show_nas, eval=TRUE, fig.align="center"}
+apply(train_data, MARGIN = 2, FUN = function(x){
+  sum(is.na(x))
+})
+```
+
+There are indeed some NAs in the data but they are located in the same variable: "hispanic_origin"
+We will deal with this issue in the next part of the analysis.
+
+Now, let's move on to the core of this analysis and let's build our classification model.
+
+# Data Munging
+
+First, we need to load the test data and process the training set and the test set exactly the same way. In order to do so efficiently, we will join the two datasets and execute the different actions on the joint dataset.
+
+## Load test data
+
+We load the test data and apply the same transformations on the categorical variables.
+```{r load_test_data, eval=TRUE}
+test_data <- data.table::fread(input = "data/census_income_test.csv", header = F, sep = ",")
+
+# rename the columns
+names(test_data) <- colnames
+
+# change the right vars to categorical
+test_data <- test_data %>%
+     mutate_each_(funs(as.factor(.))
+                  , categorical_vars)
+```
+
+We join the train set and the test set to apply the same transformation to both.
+In order to be able to separate them again, we create a variable to differenciate them.
+```{r join_data, eval=TRUE}
+train_data$train_or_test <- "train"
+test_data$train_or_test <- "test"
+
+all_data <- rbind(train_data, test_data)
+```
+
+## NAs
+There are some NA's in the data.
+`r sum(!complete.cases(all_data))` rows have at least 1 NA value.
+
+Does it come from 1 or multiple columns? We repeat the same exercise as above and see that both in the train set and the test set, the NAs come from the same variable ("hispanic_origin").
+
+If we plot the number of elements in the data by this variable:
+```{r plot_hispanic_origin, eval=TRUE, fig.align="center"}
+ggplot(data = all_data, aes(x = hispanic_origin, fill = hispanic_origin)) +
+     geom_bar() +
+     theme(legend.position = "bottom", legend.title = element_blank())
+```
+
+A crushing majority of the elements have "All other" as value for this variables. For these rows, we will thus assign the hispanic origin to the value the most elements: "All other"
+```{r remove_nas, eval=TRUE}
+all_data$hispanic_origin[is.na(all_data$hispanic_origin)] <- "All other"
+```
+There are no more NAs in the train data.
+
+
+## Binarisation of “categorical” variables
+
+We change the factor variables into dummy variables the sake of the algorithms used.
+```{r dummy_variables, eval=TRUE}
+all_data <- all_data %>%
+     mutate(target = ifelse(target == '50000+.', yes = TRUE, no = FALSE))
+
+all <- list(
+     data = all_data[, -c(ncol(all_data)-1, ncol(all_data))]
+     , label = all_data$target
+     , train_or_test = all_data$train_or_test
+)
+
+# transform all the factors into dummy variables
+data <- sparse.model.matrix(~.-1, data = all$data)
+```
+
+We re-separate the test and the train data using the train_or_test variable we create earlier.
+```{r split_data, eval=TRUE}
+train <- list(
+data = data[all$train_or_test == 'train', ]
+, label = all$label[all$train_or_test == 'train']
+)
+
+test <- list(
+data = data[all$train_or_test == 'test', ]
+, label = all$label[all$train_or_test == 'test']
+)
+```
+
+Now that both are training set and test set are ready, it is time to train our models and choose the best.
+
+# First try: XGboost vs. 1 class SVM
+
+In this part, we will train and test 2 alogorithms, without tuning them much and see which one seems to be the most 
+promising.
+The 2 algorithm that we want to test are:
+     1. One-class SVM
+     2. XGboost
+
+## 1 class SVM
+
+1 class SVM is usually used for anomaly detection. Here the dataset is very unbalanced in favor of people
+who earn less than \$50k per year. I thought we thus could see the people who earn more as "anomalies" in the data.
+Let's see how it works.
+
+```{r train_svm, eval=TRUE}
+require(e1071)
+
+x <- train$data[train$label == TRUE, ]
+y <- train$label[train$label == TRUE]
+
+model <- svm(x = x, y = y, type = 'one-classification')
+
+summary(model)
+```
+
+Let's try our model on the test data and compute some metrics of error over the prediction.
+We print the percentage of error in the prediction. However, the dataset is very unbalanced. A very naïve algorithm labelling 0 no matter the input would do pretty good with this metric.
+Let's also see how we performed on rows where target == 1.
+Finally, we print the entire confusion matrix, both on absolute and on percentage of total. The sum of the 1st diagonale of this matrix give us the percentage of good prediction.
+
+```{r predict_svm_1, eval=TRUE}
+pred <- predict(model, test$data)
+print_result_metrics(predicted = pred, actual = test$label)
+```
+
+## XGboost
+
+Now let's see if we can beat this result using xgboost.
+
+```{r train_xgbst_1, results='hide', eval=TRUE}
+xgb_params_1 = list(
+objective = "binary:logistic"
+, eval_metric = "auc"
+, scale_pos_weight = floor(length(train_data$target)/sum(train_data$target == "50000+."))
+, stratified = TRUE
+)
+
+bst <- xgboost(data = train$data
+, label = train$label
+, params = xgb_params_1
+, nthread = 2
+, nrounds = 100
+)
+```
+
+Let's predict the results for the test data with the xgboost algorithm and show the same metrics as previously.
+```{r test_xgboost_1, eval=TRUE}
+pred <- predict(bst, test$data)
+pred <- as.numeric(pred > 0.5)
+print_result_metrics(predicted = pred, actual = test$label)
+```
+
+After a first test without any optimization, we can draw the following conclusions:
+     * The 1 class svm seems to give naturally more false positive
+     * XGboost seems to be better as it returns very few false negatives (~0.72%) and less false positives 
+     even if, weighting the postive elements in order to rebalance the dataset strongly increased this number.
+
+In the following section of this analysis, we will try to optimize the parameters for the xgboost model.
+
+# XGBoost optimization
+
+## Training plots
+
+First, we plot a few training stats to get a rough idea of the parameters to use:
+```{r train_xgbst_2, eval=TRUE, results='hide'}
+# use special xgboost data class
+dtrain <- xgb.DMatrix(data = train$data, label = train$label)
+dtest <- xgb.DMatrix(data = test$data, label = test$label)
+
+# enables to get live data during the training
+watchlist <- list(train = dtrain, test = dtest)
+
+xgb_params_2 = list(
+objective = "binary:logistic"
+, eta = 0.5
+, max.depth = 8
+, eval_metric = "auc"
+, eval_metric = "logloss"
+, eval.metric = "error"
+, scale_pos_weight = floor(length(train_data$target)/sum(train_data$target == "50000+."))
+, stratified = TRUE
+, early_stop_rounds = 10
+, nfold = 10
+, showsd = TRUE
+, verbose = TRUE
+, colsample_bytree = 1
+, min_child_weight = 100
+, subsample = 1
+)
+
+bst_2 <- xgb.train(data = dtrain
+, params = xgb_params_2
+, nround = 100
+, watchlist = watchlist
+)
+```
+
+Plot, the "area under the curve" at each training round.
+```{r auc_plot, eval=TRUE, fig.align="center"}
+bst_2$evaluation_log %>%
+dplyr::select(contains("auc")) %>%
+dplyr::mutate(iteration_num = 1:n()) %>%
+reshape2::melt(., "iteration_num") %>%
+ggplot(aes(x = iteration_num, y = value, group = variable, color = variable)) +
+geom_line() + 
+theme_bw()
+```
+
+Plot, the prediction "error" at each training round.
+```{r error_plot, eval=TRUE, fig.align="center"}
+bst_2$evaluation_log %>%
+dplyr::select(contains("error")) %>%
+dplyr::mutate(iteration_num = 1:n()) %>%
+reshape2::melt(., "iteration_num") %>%
+ggplot(aes(x = iteration_num, y = value, group = variable, color = variable)) +
+geom_line() + 
+theme_bw()
+```
+
+Plot, the "logarithmic loss" at each training round.
+```{r logloss_plot, eval=FALSE, fig.align="center"}
+bst_2$evaluation_log %>%
+dplyr::select(contains("logloss")) %>%
+dplyr::mutate(iteration_num = 1:n()) %>%
+reshape2::melt(., "iteration_num") %>%
+ggplot(aes(x = iteration_num, y = value, group = variable, color = variable)) +
+geom_line() + 
+theme_bw()
+```
+
+Now let's see how we performed with this configuration.
+```{r test_xgbst_2, eval=TRUE}
+pred <- predict(bst_2, dtest)
+pred <- as.numeric(pred > 0.5)
+print_result_metrics(predicted = pred, actual = test$label)
+```
+
+## Parameters tuning using caret
+
+Let's tune the hyper parameters:
+```{r caret_search, eval=FALSE}
+# Data frame of parameters we want to test the model for:
+xgb_grid_1 <- expand.grid(
+     eta = c(.1, 0.5, 1)
+     , max_depth = c(4, 8, 10, 20)
+     , nrounds = 100
+     , colsample_bytree = 1
+     , min_child_weight = c(1, 5, 10, 20)
+     , subsample = 1
+     , gamma = 0
+)
+
+watchlist <- list(train = dtrain, test = dtest)
+
+# pack the training control parameters
+xgb_trcontrol_1 = caret::trainControl(
+     method = "repeatedcv",
+     repeats = 2,
+     number = 2,
+     verboseIter = TRUE,
+     returnData = FALSE,
+     returnResamp = "all",
+     classProbs = TRUE,
+     summaryFunction = twoClassSummary,
+     allowParallel = TRUE
+)
+
+train$label <- factor(train$label, labels = c("no", "yes"))
+
+set.seed(27)
+
+xgb_train_1 <- caret::train(
+     x = data.matrix(train$data)
+     , y = train$label
+     , trControl = xgb_trcontrol_1
+     , tuneGrid = xgb_grid_1
+     , method = "xgbTree"
+     , verbose = T
+     , metric = "ROC"
+     , nthread = 3
+     , scale_pos_weight = floor(length(train_data$target)/sum(train_data$target == "50000+."))
+     , stratified = TRUE
+     , early_stop_rounds = 10
+     , nfold = 10
+)
+
+xgb_train_1$results %>% 
+     ggplot(aes(x = min_child_weight, y = max_depth, size = ROC, color = ROC)) +
+     geom_point() +
+     theme_bw() +
+     scale_size_continuous(guide = "none")
+```
+
+[Caret Plot Result](presentation/caret_2.jpeg)
+
+We now have a set of "optimal" hyper-parameters to use in our xgboost model. Let's train a model using these parameters and see how they perform.
+We could then use.
+```{r train_xgboost_3, eval=FALSE, results='hide'}
+bst_3 <- xgb.train(data = dtrain
+     , params = xgb_train_1$bestTune
+     , nround = 100
+     , watchlist = watchlist
+     , eval_metric = "auc"
+     , eval_metric = "logloss"
+     , eval.metric = "error"
+     , scale_pos_weight = floor(length(train_data$target)/sum(train_data$target == "50000+."))
+     , stratified = TRUE
+     , early_stop_rounds = 10
+     , nfold = 10
+     , showsd = TRUE
+     , verbose = TRUE
+)
+```
+However, for the purpose of knitting this presentation, we will directly use the result of caret.
+The search gave us the following result:
+```
+Selecting tuning parameters
+Fitting nrounds = 100, max_depth = 10, eta = 0.1, gamma = 0, colsample_bytree = 1, min_child_weight = 20, subsample = 1 on full training set
+```
+We use this set of hyper-parameters to train our model.
+```{r train_xgbst_opt, eval=TRUE, results='hide'}
+# parameters list based on the result of caret.
+xgb_params_opt = list(
+     objective = "binary:logistic"
+     , eta = 0.1
+     , max.depth = 10
+     , eval_metric = "auc"
+     , eval_metric = "logloss"
+     , eval.metric = "error"
+     , scale_pos_weight = floor(length(train_data$target)/sum(train_data$target == "50000+."))
+     , stratified = TRUE
+     , early_stop_rounds = 10
+     , nfold = 10
+     , showsd = TRUE
+     , verbose = TRUE
+     , colsample_bytree = 1
+     , min_child_weight = 20
+     , subsample = 1
+     , gamma = 0
+)
+
+bst_opt <- xgb.train(
+     data = dtrain
+     , params = xgb_params_opt
+     , nround = 100
+     , watchlist = watchlist
+)
+```
+
+Finally we test our model a last time:
+```{r test_xgboost_3, eval=TRUE}
+pred <- predict(bst_opt, dtest)
+pred <- as.numeric(pred > 0.5)
+print_result_metrics(predicted = pred, actual = test$label)
+```
+
+## Analyse results
+
+One interesting thing to see is to get a notion of the importance of each variable in the result.
+
+```{r feature_importance, eval=TRUE, fig.align="center"}
+importance <- xgb.importance(feature_names = colnames(train$data), model = bst_2)
+xgb.plot.importance(importance_matrix = importance, top_n = 20)
+```
+
+# Conclusion
+
+In this analysis, we saw all the classic steps of building quickly a simple ml model.
+XGboost worked very well in the beginning and we improved the performance using the right hyper parameters.
+It worked decently on the test set and should now be confronted to more "real" data to confirm its performance.
