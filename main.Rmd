@@ -486,7 +486,7 @@ theme_bw()
 ```
 
 Plot, the "logarithmic loss" at each training round.
-```{r logloss_plot, eval=FALSE, fig.align="center"}
+```{r logloss_plot, eval=TRUE, fig.align="center"}
 bst_2$evaluation_log %>%
 dplyr::select(contains("logloss")) %>%
 dplyr::mutate(iteration_num = 1:n()) %>%
