@@ -332,7 +332,7 @@ grid.arrange(do.call(arrangeGrob, plots[c("education", "labor_union", "same_hous
 
 <img src="main_files/figure-markdown_github/plot_percentages_2-1.png" style="display: block; margin: auto;" />
 
-In the opposite, if we show percentages of each target bucket by category:
+In the opposite, if we show percentages of each target bucketed by category:
 
 ``` r
 require(lazyeval)
@@ -363,7 +363,7 @@ grid.arrange(do.call(arrangeGrob, plots[c("education", "labor_union", "same_hous
 
 <img src="main_files/figure-markdown_github/plot_percentages_bucket-1.png" style="display: block; margin: auto;" />
 
-The dataset being very unbalance no mater the category we choose the split it. However, we clearly that the share of people in the +$50k bucket is much higher for people with higher education. Actually, for some particular education levels, it is more than 50% of the population (PhD and Prof school degree).
+The dataset being very unbalance no mater the variable we choose the split it by. However, we clearly that the share of people in the +$50k bucket is much higher for people with higher education. Actually, for some particular education levels, it is more than 50% of the population (PhD and Prof school degree).
 
 You can plot all the charts, 3 by 3 running:
 
@@ -964,7 +964,7 @@ Analyse results
 One interesting thing to see is to get a notion of the importance of each variable in the result.
 
 ``` r
-importance <- xgb.importance(feature_names = colnames(train$data), model = bst_2)
+importance <- xgb.importance(feature_names = colnames(train$data), model = bst_opt)
 xgb.plot.importance(importance_matrix = importance, top_n = 20)
 ```
 
